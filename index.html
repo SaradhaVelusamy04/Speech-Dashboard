@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Speech-to-Text Dashboard</title>
+  <!-- Google Fonts: Outfit (UI) and Inter (Transcripts) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <!-- Background Gradients -->
+  <div class="bg-glow bg-glow-1"></div>
+  <div class="bg-glow bg-glow-2"></div>
+
+  <!-- Main Container -->
+  <main id="app-container">
+    
+    <!-- LOADING STATE -->
+    <div id="loading-screen" class="screen active">
+      <div class="loader-container">
+        <div class="pulse-ring"></div>
+        <div class="loader-text">Initializing Secure Connection...</div>
+      </div>
+    </div>
+
+    <!-- CONFIG / SETUP SCREEN (Shown if .env credentials missing) -->
+    <div id="config-screen" class="screen">
+      <div class="glass-card config-card">
+        <div class="card-header">
+          <div class="logo-mark">⚡</div>
+          <h2>Configure API Services</h2>
+          <p>Please enter your API keys and configuration details below. These are stored locally in your browser and never shared.</p>
+        </div>
+
+        <form id="config-form" class="form-grid">
+          <div class="form-group">
+            <label for="cfg-subdomain">Nhost Subdomain</label>
+            <input type="text" id="cfg-subdomain" placeholder="e.g. abcdefghijklmnopqr" required>
+            <small>Found in your Nhost Dashboard URL: <code>https://[subdomain].auth.nhost.run</code></small>
+          </div>
+
+          <div class="form-group">
+            <label for="cfg-region">Nhost Region</label>
+            <input type="text" id="cfg-region" placeholder="e.g. eu-central-1" required>
+          </div>
+
+          <div class="form-group">
+            <label for="cfg-deepgram">Deepgram API Key</label>
+            <input type="password" id="cfg-deepgram" placeholder="Enter your Deepgram API Key" required>
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-glow">Save & Continue</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- AUTHENTICATION SCREEN (Login/Signup) -->
+    <div id="auth-screen" class="screen">
+      <div class="glass-card auth-card">
+        <!-- Tab Switcher -->
+        <div class="auth-tabs">
+          <button type="button" id="tab-login" class="tab-btn active">Sign In</button>
+          <button type="button" id="tab-signup" class="tab-btn">Create Account</button>
+        </div>
+
+        <!-- Auth Forms -->
+        <div class="auth-body">
+          <div class="auth-header">
+            <h2 id="auth-title">Welcome Back</h2>
+            <p id="auth-subtitle">Sign in to access your speech-to-text dashboard.</p>
+          </div>
+
+          <form id="auth-form" class="form-grid">
+            <div class="form-group">
+              <label for="auth-email">Email Address</label>
+              <input type="email" id="auth-email" placeholder="you@example.com" required autocomplete="username">
+            </div>
+
+            <div class="form-group">
+              <label for="auth-password">Password</label>
+              <input type="password" id="auth-password" placeholder="••••••••" required autocomplete="current-password">
+            </div>
+
+            <!-- Error Banner -->
+            <div id="auth-error" class="alert alert-danger hidden">
+              <span class="alert-icon">⚠️</span>
+              <span class="alert-message">Invalid email or password</span>
+            </div>
+
+            <!-- Success Banner -->
+            <div id="auth-success" class="alert alert-success hidden">
+              <span class="alert-icon">✅</span>
+              <span class="alert-message">Success! Redirecting...</span>
+            </div>
+
+            <button type="submit" id="auth-submit-btn" class="btn btn-primary btn-glow">
+              <span class="btn-text">Sign In</span>
+              <div class="btn-loader hidden"></div>
+            </button>
+          </form>
+        </div>
+
+        <!-- Footnote to configure dynamic API keys -->
+        <div class="auth-footer">
+          <button type="button" id="btn-show-config" class="link-btn">Configure API Services</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- DASHBOARD SCREEN (Protected) -->
+    <div id="dashboard-screen" class="screen">
+      <!-- Navbar -->
+      <header class="navbar">
+        <div class="nav-brand">
+          <span class="brand-logo">🎙️</span>
+          <h1>EchoStream</h1>
+          <span class="badge badge-success">Live</span>
+        </div>
+        <div class="nav-user">
+          <span id="user-email-display" class="user-email">user@example.com</span>
+          <button id="btn-signout" class="btn btn-secondary btn-small">Sign Out</button>
+        </div>
+      </header>
+
+      <!-- Main Layout -->
+      <div class="dashboard-grid">
+        
+        <!-- Controls & Status (Left Panel) -->
+        <div class="dashboard-sidebar">
+          
+          <!-- Mic Control Card -->
+          <div class="glass-card mic-card">
+            <h3>Microphone Control</h3>
+            <p class="muted">Press the button below to start streaming audio.</p>
+            
+            <div class="mic-button-wrapper">
+              <button id="btn-mic" class="mic-btn" aria-label="Toggle Microphone">
+                <div class="mic-icon-container">
+                  <!-- Mic Icon -->
+                  <svg id="icon-mic-off" class="mic-svg active" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="1" y1="1" x2="23" y2="23"></line>
+                    <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path>
+                    <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
+                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                  </svg>
+                  <svg id="icon-mic-on" class="mic-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                  </svg>
+                </div>
+                <div class="mic-pulse-ring ring-1"></div>
+                <div class="mic-pulse-ring ring-2"></div>
+              </button>
+            </div>
+
+            <div class="mic-status-label">
+              <span id="mic-status-text">Microphone Idle</span>
+            </div>
+
+            <!-- Web Audio Wave Visualizer -->
+            <div class="visualizer-container">
+              <canvas id="audio-visualizer"></canvas>
+            </div>
+          </div>
+
+          <!-- Connection Status Card -->
+          <div class="glass-card status-card">
+            <h3>System Status</h3>
+            <ul class="status-list">
+              <li>
+                <span class="status-name">Nhost Auth</span>
+                <span id="status-auth" class="status-indicator indicator-success">Active</span>
+              </li>
+              <li>
+                <span class="status-name">Deepgram WebSocket</span>
+                <span id="status-websocket" class="status-indicator indicator-muted">Disconnected</span>
+              </li>
+              <li>
+                <span class="status-name">Audio Capture</span>
+                <span id="status-audio" class="status-indicator indicator-muted">Inactive</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Transcript Window (Right Panel) -->
+        <div class="dashboard-content">
+          <div class="glass-card transcript-card">
+            <div class="transcript-header">
+              <div class="title-with-count">
+                <h3>Live Transcript</h3>
+                <span id="word-count" class="badge">0 words</span>
+              </div>
+              <div class="transcript-actions">
+                <button id="btn-copy" class="btn btn-secondary btn-small" title="Copy transcript">
+                  <span>Copy</span>
+                </button>
+                <button id="btn-clear" class="btn btn-secondary btn-small" title="Clear transcript">
+                  <span>Clear</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Transcript Feed -->
+            <div id="transcript-feed" class="transcript-feed">
+              <div id="transcript-empty" class="transcript-empty-state">
+                <div class="empty-icon">💬</div>
+                <p>No audio streamed yet. Click the microphone button and start speaking to see real-time transcription.</p>
+              </div>
+              <!-- Appended sentences will go here -->
+              <div id="transcript-container" class="transcript-container hidden">
+                <span id="transcript-final" class="transcript-final-text"></span>
+                <span id="transcript-interim" class="transcript-interim-text"></span>
+              </div>
+            </div>
+
+            <!-- Visual Typing Indicator / Connection Indicator -->
+            <div id="transcribe-indicator" class="transcribe-indicator hidden">
+              <div class="dot-pulse">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+              <span class="indicator-label">Listening for speech...</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Script Modules -->
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
