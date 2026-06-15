@@ -1,65 +1,26 @@
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@nhost/nhost-js@4.7.1/+esm';
+/**
+ * EchoStream — Live Speech-to-Text Client
+ *
+ * Architecture:
+ *   1. Fetch server config → decide if setup screen is needed
+ *   2. Init Nhost client → auth state drives screen routing
+ *   3. On mic click → getUserMedia → open WebSocket to /ws/transcribe
+ *   4. Wait for backend "ready" (Deepgram connected) → start MediaRecorder
+ *   5. Stream audio chunks → receive & render transcript JSON
+ */
 
-// App state
+import { NhostClient } from 'https://esm.sh/@nhost/nhost-js@2.2.18';
+
+// ─── App State ───────────────────────────────────────────────────────────────
 let nhost = null;
 let currentConfig = {
   nhostSubdomain: '',
   nhostRegion: '',
   hasDeepgramKey: false,
-  localDeepgramKey: ''
+  localDeepgramKey: '',
 };
 
-// UI Elements
-const loadingScreen = document.getElementById('loading-screen');
-const configScreen = document.getElementById('config-screen');
-const authScreen = document.getElementById('auth-screen');
-const dashboardScreen = document.getElementById('dashboard-screen');
-
-const configForm = document.getElementById('config-form');
-const cfgSubdomain = document.getElementById('cfg-subdomain');
-const cfgRegion = document.getElementById('cfg-region');
-const cfgDeepgram = document.getElementById('cfg-deepgram');
-
-const authForm = document.getElementById('auth-form');
-const authEmail = document.getElementById('auth-email');
-const authPassword = document.getElementById('auth-password');
-const authSubmitBtn = document.getElementById('auth-submit-btn');
-const authError = document.getElementById('auth-error');
-const authSuccess = document.getElementById('auth-success');
-const btnShowConfig = document.getElementById('btn-show-config');
-
-const tabLogin = document.getElementById('tab-login');
-const tabSignup = document.getElementById('tab-signup');
-const authTitle = document.getElementById('auth-title');
-const authSubtitle = document.getElementById('auth-subtitle');
-
-const userEmailDisplay = document.getElementById('user-email-display');
-const btnSignout = document.getElementById('btn-signout');
-
-// Controls & Status (Dashboard)
-const btnMic = document.getElementById('btn-mic');
-const micStatusText = document.getElementById('mic-status-text');
-const iconMicOn = document.getElementById('icon-mic-on');
-const iconMicOff = document.getElementById('icon-mic-off');
-const statusAuth = document.getElementById('status-auth');
-const statusWebsocket = document.getElementById('status-websocket');
-const statusAudio = document.getElementById('status-audio');
-
-// Transcript View
-const transcriptFeed = document.getElementById('transcript-feed');
-const transcriptEmpty = document.getElementById('transcript-empty');
-const transcriptContainer = document.getElementById('transcript-container');
-const transcriptFinal = document.getElementById('transcript-final');
-const transcriptInterim = document.getElementById('transcript-interim');
-const wordCountBadge = document.getElementById('word-count');
-const btnCopy = document.getElementById('btn-copy');
-const btnClear = document.getElementById('btn-clear');
-const transcribeIndicator = document.getElementById('transcribe-indicator');
-
-// Auth View Mode ('login' or 'signup')
-let authMode = 'login';
-
-// Streaming Variables
+let authMode = 'login'; // 'login' | 'signup'
 let isRecording = false;
 let mediaStream = null;
 let mediaRecorder = null;
@@ -67,490 +28,494 @@ let wsConn = null;
 let finalTranscriptHistory = '';
 let totalWords = 0;
 
-// Audio Visualizer
+// Audio visualizer refs
 let audioCtx = null;
 let analyser = null;
 let dataArray = null;
 let visualizerSource = null;
-let drawRequestFrame = null;
+let animFrameId = null;
 
-// Initialize app config
+// ─── DOM References ──────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+
+const screens = {
+  loading:   $('loading-screen'),
+  config:    $('config-screen'),
+  auth:      $('auth-screen'),
+  dashboard: $('dashboard-screen'),
+};
+
+const dom = {
+  // Config form
+  configForm:   $('config-form'),
+  cfgSubdomain: $('cfg-subdomain'),
+  cfgRegion:    $('cfg-region'),
+  cfgDeepgram:  $('cfg-deepgram'),
+
+  // Auth
+  authForm:      $('auth-form'),
+  authEmail:     $('auth-email'),
+  authPassword:  $('auth-password'),
+  authSubmitBtn: $('auth-submit-btn'),
+  authError:     $('auth-error'),
+  authSuccess:   $('auth-success'),
+  authTitle:     $('auth-title'),
+  authSubtitle:  $('auth-subtitle'),
+  tabLogin:      $('tab-login'),
+  tabSignup:     $('tab-signup'),
+  btnShowConfig: $('btn-show-config'),
+
+  // Dashboard
+  userEmail:       $('user-email-display'),
+  btnSignout:      $('btn-signout'),
+  btnMic:          $('btn-mic'),
+  micStatusText:   $('mic-status-text'),
+  iconMicOn:       $('icon-mic-on'),
+  iconMicOff:      $('icon-mic-off'),
+  statusAuth:      $('status-auth'),
+  statusWebsocket: $('status-websocket'),
+  statusAudio:     $('status-audio'),
+
+  // Transcript
+  transcriptFeed:      $('transcript-feed'),
+  transcriptEmpty:     $('transcript-empty'),
+  transcriptContainer: $('transcript-container'),
+  transcriptFinal:     $('transcript-final'),
+  transcriptInterim:   $('transcript-interim'),
+  wordCount:           $('word-count'),
+  btnCopy:             $('btn-copy'),
+  btnClear:            $('btn-clear'),
+  transcribeIndicator: $('transcribe-indicator'),
+
+  // Canvas
+  canvas: $('audio-visualizer'),
+};
+
+// ─── Screen Navigation ───────────────────────────────────────────────────────
+function showScreen(name) {
+  Object.values(screens).forEach((el) => el.classList.remove('active'));
+  screens[name].classList.add('active');
+}
+
+// ─── App Bootstrap ───────────────────────────────────────────────────────────
 async function initApp() {
+  showScreen('loading');
+
   try {
-    // 1. Fetch server environment variables
     const res = await fetch('/api/config');
-    const serverConfig = await res.json();
-    
-    currentConfig.nhostSubdomain = serverConfig.nhostSubdomain || localStorage.getItem('nhost_subdomain') || '';
-    currentConfig.nhostRegion = serverConfig.nhostRegion || localStorage.getItem('nhost_region') || '';
-    currentConfig.hasDeepgramKey = serverConfig.hasDeepgramKey || false;
-    currentConfig.localDeepgramKey = localStorage.getItem('deepgram_api_key') || '';
+    if (!res.ok) throw new Error(`Config fetch failed (${res.status})`);
+    const serverCfg = await res.json();
 
-    // 2. Determine if we have enough config to run Nhost
-    if (currentConfig.nhostSubdomain && currentConfig.nhostRegion) {
-      setupNhost();
-    } else {
-      // Show config panel
-      showScreen(configScreen);
+    currentConfig.nhostSubdomain =
+      serverCfg.nhostSubdomain || localStorage.getItem('nhost_subdomain') || '';
+    currentConfig.nhostRegion =
+      serverCfg.nhostRegion || localStorage.getItem('nhost_region') || '';
+    currentConfig.hasDeepgramKey = serverCfg.hasDeepgramKey;
+    currentConfig.localDeepgramKey =
+      localStorage.getItem('deepgram_api_key') || '';
+
+    if (!currentConfig.nhostSubdomain || !currentConfig.nhostRegion) {
+      showScreen('config');
+      return;
     }
+
+    initNhost();
+    showScreen('auth');
   } catch (err) {
-    console.error('Initialization failed:', err);
-    // Standard local storage fallback
-    currentConfig.nhostSubdomain = localStorage.getItem('nhost_subdomain') || '';
-    currentConfig.nhostRegion = localStorage.getItem('nhost_region') || '';
-    currentConfig.localDeepgramKey = localStorage.getItem('deepgram_api_key') || '';
-
-    if (currentConfig.nhostSubdomain && currentConfig.nhostRegion) {
-      setupNhost();
-    } else {
-      showScreen(configScreen);
-    }
+    console.error('initApp error:', err);
+    showScreen('config');
   }
 }
 
-// Setup Nhost Client
-function setupNhost() {
+// ─── Nhost Client ────────────────────────────────────────────────────────────
+function initNhost() {
   try {
-    nhost = createClient({
+    nhost = new NhostClient({
       subdomain: currentConfig.nhostSubdomain,
-      region: currentConfig.nhostRegion
+      region: currentConfig.nhostRegion,
     });
 
-    // Monitor Auth State
-    nhost.auth.onAuthStateChange((event, session) => {
-      console.log('Nhost Auth Event:', event);
-      if (nhost.auth.isAuthenticated()) {
-        const user = nhost.auth.getUser();
-        userEmailDisplay.textContent = user.email;
-        statusAuth.textContent = 'Active';
-        statusAuth.className = 'status-indicator indicator-success';
-        showScreen(dashboardScreen);
-      } else {
-        statusAuth.textContent = 'Inactive';
-        statusAuth.className = 'status-indicator indicator-muted';
-        showScreen(authScreen);
+    nhost.auth.onAuthStateChanged((event, session) => {
+      console.log('[auth]', event);
+
+      if (event === 'SIGNED_IN' && session) {
+        dom.userEmail.textContent = session.user.email;
+        setStatus('statusAuth', 'Active', 'success');
+        showScreen('dashboard');
+      } else if (event === 'SIGNED_OUT') {
+        setStatus('statusAuth', 'Inactive', 'muted');
+        showScreen('auth');
       }
     });
   } catch (err) {
-    console.error('Failed to initialize Nhost Client:', err);
-    alert('Nhost Client initialization failed. Check your Subdomain and Region settings.');
-    showScreen(configScreen);
+    console.error('Nhost init error:', err);
+    showScreen('config');
   }
 }
 
-// Switch Screens
-function showScreen(screenEl) {
-  [loadingScreen, configScreen, authScreen, dashboardScreen].forEach(s => {
-    s.classList.remove('active');
-  });
-  screenEl.classList.add('active');
+// ─── Auth Helpers ────────────────────────────────────────────────────────────
+function setAuthMode(mode) {
+  authMode = mode;
+  hideAlerts();
+
+  const isLogin = mode === 'login';
+  dom.tabLogin.classList.toggle('active', isLogin);
+  dom.tabSignup.classList.toggle('active', !isLogin);
+  dom.authTitle.textContent = isLogin ? 'Welcome Back' : 'Create Account';
+  dom.authSubtitle.textContent = isLogin
+    ? 'Sign in to access your speech-to-text dashboard.'
+    : 'Register a new account using your email.';
+  dom.authSubmitBtn.querySelector('.btn-text').textContent = isLogin
+    ? 'Sign In'
+    : 'Sign Up';
 }
 
-// Set up UI event listeners
+function setAuthLoading(loading) {
+  dom.authSubmitBtn.toggleAttribute('disabled', loading);
+  dom.authSubmitBtn.querySelector('.btn-text').classList.toggle('hidden', loading);
+  dom.authSubmitBtn.querySelector('.btn-loader').classList.toggle('hidden', !loading);
+}
+
+function showAlert(type, msg) {
+  const el = type === 'error' ? dom.authError : dom.authSuccess;
+  el.querySelector('.alert-message').textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function hideAlerts() {
+  dom.authError.classList.add('hidden');
+  dom.authSuccess.classList.add('hidden');
+}
+
+// ─── Status Badge Helper ─────────────────────────────────────────────────────
+function setStatus(key, label, variant) {
+  const el = dom[key];
+  el.textContent = label;
+  el.className = `status-indicator indicator-${variant}`;
+}
+
+// ─── Streaming Logic ─────────────────────────────────────────────────────────
+async function startStreaming() {
+  try {
+    // 1. Acquire microphone
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        channelCount: 1,
+        sampleRate: 16000,
+      },
+    });
+    setStatus('statusAudio', 'Active', 'success');
+
+    // 2. Open WebSocket to backend proxy
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let wsUrl = `${proto}//${location.host}/ws/transcribe`;
+    if (!currentConfig.hasDeepgramKey && currentConfig.localDeepgramKey) {
+      wsUrl += `?apiKey=${encodeURIComponent(currentConfig.localDeepgramKey)}`;
+    }
+
+    wsConn = new WebSocket(wsUrl);
+    setStatus('statusWebsocket', 'Connecting…', 'warning');
+
+    wsConn.onopen = () => {
+      console.log('[ws] Connected to backend — waiting for Deepgram handshake…');
+    };
+
+    wsConn.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        // Backend signals Deepgram is ready — safe to stream now
+        if (data.status === 'ready') {
+          console.log('[ws] Deepgram ready. Starting audio capture.');
+          setStatus('statusWebsocket', 'Connected', 'success');
+          dom.transcribeIndicator.classList.remove('hidden');
+          setMicUI(true);
+          beginRecording();
+          startVisualizer(mediaStream);
+          return;
+        }
+
+        // Error from backend
+        if (data.error) {
+          showAlert('error', data.error);
+          stopStreaming();
+          return;
+        }
+
+        // Deepgram transcript payload
+        handleTranscript(data);
+      } catch (err) {
+        console.error('[ws] Parse error:', err);
+      }
+    };
+
+    wsConn.onerror = () => {
+      setStatus('statusWebsocket', 'Error', 'danger');
+    };
+
+    wsConn.onclose = () => {
+      console.log('[ws] Closed.');
+      setStatus('statusWebsocket', 'Disconnected', 'muted');
+      stopStreaming();
+    };
+  } catch (err) {
+    console.error('startStreaming error:', err);
+    showAlert('error', 'Microphone access denied or unavailable.');
+    stopStreaming();
+  }
+}
+
+function beginRecording() {
+  isRecording = true;
+  mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0 && wsConn?.readyState === WebSocket.OPEN) {
+      wsConn.send(e.data);
+    }
+  };
+
+  mediaRecorder.start(100); // chunk every 100ms
+}
+
+function stopStreaming() {
+  isRecording = false;
+
+  if (mediaRecorder?.state !== 'inactive') {
+    try { mediaRecorder?.stop(); } catch { /* already stopped */ }
+  }
+  mediaRecorder = null;
+
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+  }
+  mediaStream = null;
+  setStatus('statusAudio', 'Inactive', 'muted');
+
+  if (wsConn?.readyState === WebSocket.OPEN) {
+    wsConn.close();
+  }
+  wsConn = null;
+
+  setMicUI(false);
+  dom.transcribeIndicator.classList.add('hidden');
+  stopVisualizer();
+}
+
+// ─── Mic UI Toggle ───────────────────────────────────────────────────────────
+function setMicUI(active) {
+  dom.btnMic.classList.toggle('recording', active);
+  dom.iconMicOn.classList.toggle('active', active);
+  dom.iconMicOff.classList.toggle('active', !active);
+  dom.micStatusText.textContent = active ? 'Streaming Audio' : 'Microphone Idle';
+  dom.micStatusText.classList.toggle('recording', active);
+}
+
+// ─── Transcript Rendering ────────────────────────────────────────────────────
+function handleTranscript(data) {
+  const alt = data?.channel?.alternatives?.[0];
+  if (!alt?.transcript) return;
+
+  dom.transcriptEmpty.classList.add('hidden');
+  dom.transcriptContainer.classList.remove('hidden');
+
+  if (data.is_final) {
+    finalTranscriptHistory += ' ' + alt.transcript;
+    dom.transcriptFinal.textContent = finalTranscriptHistory.trim() + ' ';
+    dom.transcriptInterim.textContent = '';
+  } else {
+    dom.transcriptInterim.textContent = alt.transcript;
+  }
+
+  updateWordCount();
+  dom.transcriptFeed.scrollTop = dom.transcriptFeed.scrollHeight;
+}
+
+function updateWordCount() {
+  const text = (finalTranscriptHistory + ' ' + dom.transcriptInterim.textContent).trim();
+  totalWords = text ? text.split(/\s+/).filter(Boolean).length : 0;
+  dom.wordCount.textContent = `${totalWords} word${totalWords === 1 ? '' : 's'}`;
+}
+
+function clearTranscript() {
+  finalTranscriptHistory = '';
+  dom.transcriptFinal.textContent = '';
+  dom.transcriptInterim.textContent = '';
+  totalWords = 0;
+  dom.wordCount.textContent = '0 words';
+  dom.transcriptEmpty.classList.remove('hidden');
+  dom.transcriptContainer.classList.add('hidden');
+}
+
+// ─── Audio Visualizer ────────────────────────────────────────────────────────
+function startVisualizer(stream) {
+  const ctx = dom.canvas.getContext('2d');
+
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 128;
+  const bufLen = analyser.frequencyBinCount;
+  dataArray = new Uint8Array(bufLen);
+
+  visualizerSource = audioCtx.createMediaStreamSource(stream);
+  visualizerSource.connect(analyser);
+
+  const draw = () => {
+    animFrameId = requestAnimationFrame(draw);
+    analyser.getByteFrequencyData(dataArray);
+
+    ctx.fillStyle = 'rgba(10, 14, 25, 0.4)';
+    ctx.fillRect(0, 0, dom.canvas.width, dom.canvas.height);
+
+    const barW = (dom.canvas.width / bufLen) * 1.5;
+    let x = 0;
+
+    for (let i = 0; i < bufLen; i++) {
+      const barH = (dataArray[i] / 255) * dom.canvas.height * 0.9;
+      const grad = ctx.createLinearGradient(0, dom.canvas.height, 0, 0);
+      grad.addColorStop(0, 'rgba(0, 242, 254, 0.15)');
+      grad.addColorStop(0.5, 'rgba(0, 242, 254, 0.65)');
+      grad.addColorStop(1, 'rgba(108, 38, 255, 0.85)');
+      ctx.fillStyle = grad;
+
+      const yOff = (dom.canvas.height - barH) / 2;
+      ctx.fillRect(x, yOff, barW - 3, barH);
+      x += barW;
+    }
+  };
+  draw();
+}
+
+function stopVisualizer() {
+  if (animFrameId) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+  if (visualizerSource) {
+    visualizerSource.disconnect();
+    visualizerSource = null;
+  }
+  const ctx = dom.canvas.getContext('2d');
+  ctx.fillStyle = '#0a0e19';
+  ctx.fillRect(0, 0, dom.canvas.width, dom.canvas.height);
+}
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  dom.canvas.width = dom.canvas.parentElement.clientWidth * dpr;
+  dom.canvas.height = dom.canvas.parentElement.clientHeight * dpr;
+}
+
+// ─── Event Wiring ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   initApp();
 
-  // Tab switcher
-  tabLogin.addEventListener('click', () => setAuthMode('login'));
-  tabSignup.addEventListener('click', () => setAuthMode('signup'));
+  // Auth tabs
+  dom.tabLogin.addEventListener('click', () => setAuthMode('login'));
+  dom.tabSignup.addEventListener('click', () => setAuthMode('signup'));
 
-  // Show config manually from auth page
-  btnShowConfig.addEventListener('click', () => {
-    cfgSubdomain.value = currentConfig.nhostSubdomain;
-    cfgRegion.value = currentConfig.nhostRegion;
-    cfgDeepgram.value = currentConfig.localDeepgramKey;
-    showScreen(configScreen);
+  // Manual config
+  dom.btnShowConfig.addEventListener('click', () => {
+    dom.cfgSubdomain.value = currentConfig.nhostSubdomain;
+    dom.cfgRegion.value = currentConfig.nhostRegion;
+    dom.cfgDeepgram.value = currentConfig.localDeepgramKey;
+    showScreen('config');
   });
 
-  // Config Submit
-  configForm.addEventListener('submit', (e) => {
+  // Config form
+  dom.configForm.addEventListener('submit', (e) => {
     e.preventDefault();
-    const sub = cfgSubdomain.value.trim();
-    const reg = cfgRegion.value.trim();
-    const dgKey = cfgDeepgram.value.trim();
+    const sub = dom.cfgSubdomain.value.trim();
+    const reg = dom.cfgRegion.value.trim();
+    const dgKey = dom.cfgDeepgram.value.trim();
 
     localStorage.setItem('nhost_subdomain', sub);
     localStorage.setItem('nhost_region', reg);
-    if (dgKey) {
-      localStorage.setItem('deepgram_api_key', dgKey);
-    }
+    if (dgKey) localStorage.setItem('deepgram_api_key', dgKey);
 
-    currentConfig.nhostSubdomain = sub;
-    currentConfig.nhostRegion = reg;
-    currentConfig.localDeepgramKey = dgKey;
+    Object.assign(currentConfig, {
+      nhostSubdomain: sub,
+      nhostRegion: reg,
+      localDeepgramKey: dgKey,
+    });
 
-    showScreen(loadingScreen);
-    setupNhost();
+    initNhost();
+    showScreen('auth');
   });
 
-  // Auth Form Submit
-  authForm.addEventListener('submit', async (e) => {
+  // Auth form
+  dom.authForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const email = authEmail.value.trim();
-    const password = authPassword.value;
+    const email = dom.authEmail.value.trim();
+    const password = dom.authPassword.value;
+
+    if (!email || !password) return;
 
     setAuthLoading(true);
     hideAlerts();
 
     try {
       if (authMode === 'login') {
-        const { session, error } = await nhost.auth.signInEmailPassword({ email, password });
+        const { session, error } = await nhost.auth.signIn({ email, password });
         if (error) throw error;
-        showSuccess('Logged in successfully!');
-      } else {
-        const { session, error } = await nhost.auth.signUpEmailPassword({ email, password });
-        if (error) throw error;
-        
-        // Some Nhost instances verify email, check if user session returned immediately
         if (session) {
-          showSuccess('Account created and logged in!');
+          dom.userEmail.textContent = session.user.email;
+          showScreen('dashboard');
+        }
+      } else {
+        const { session, error } = await nhost.auth.signUp({ email, password });
+        if (error) throw error;
+        if (session) {
+          dom.userEmail.textContent = session.user.email;
+          showScreen('dashboard');
         } else {
-          showSuccess('Account created! Please check your email to verify or sign in.');
+          showAlert('success', 'Account created! Check your email to verify, then sign in.');
           setAuthMode('login');
         }
       }
     } catch (err) {
-      console.error(err);
-      showError(err.message || 'Authentication failed. Please check your credentials.');
+      console.error('[auth] Error:', err);
+      showAlert('error', err.message || 'Authentication failed. Please check your credentials.');
     } finally {
       setAuthLoading(false);
     }
   });
 
-  // Sign out Button
-  btnSignout.addEventListener('click', async () => {
-    if (isRecording) {
-      stopStreaming();
-    }
+  // Sign out
+  dom.btnSignout.addEventListener('click', async () => {
+    if (isRecording) stopStreaming();
     await nhost.auth.signOut();
   });
 
-  // Microphone toggle button
-  btnMic.addEventListener('click', () => {
-    if (isRecording) {
-      stopStreaming();
-    } else {
-      startStreaming();
+  // Mic toggle
+  dom.btnMic.addEventListener('click', () => {
+    isRecording ? stopStreaming() : startStreaming();
+  });
+
+  // Copy transcript
+  dom.btnCopy.addEventListener('click', async () => {
+    const text = (finalTranscriptHistory + ' ' + dom.transcriptInterim.textContent).trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      const orig = dom.btnCopy.textContent;
+      dom.btnCopy.textContent = 'Copied!';
+      setTimeout(() => (dom.btnCopy.textContent = orig), 2000);
+    } catch (err) {
+      console.error('Copy failed:', err);
     }
   });
 
-  // Copy Transcript
-  btnCopy.addEventListener('click', () => {
-    const fullText = (finalTranscriptHistory + ' ' + transcriptInterim.textContent).trim();
-    if (fullText) {
-      navigator.clipboard.writeText(fullText)
-        .then(() => {
-          const originalText = btnCopy.textContent;
-          btnCopy.textContent = 'Copied!';
-          setTimeout(() => btnCopy.textContent = originalText, 2000);
-        })
-        .catch(err => console.error('Copy failed:', err));
-    }
-  });
+  // Clear transcript
+  dom.btnClear.addEventListener('click', clearTranscript);
 
-  // Clear Transcript
-  btnClear.addEventListener('click', () => {
-    finalTranscriptHistory = '';
-    transcriptFinal.textContent = '';
-    transcriptInterim.textContent = '';
-    totalWords = 0;
-    wordCountBadge.textContent = '0 words';
-    transcriptEmpty.classList.remove('hidden');
-    transcriptContainer.classList.add('hidden');
-  });
-
-  // Keep Canvas visualizer responsive
-  const canvas = document.getElementById('audio-visualizer');
-  const resizeCanvas = () => {
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvas.parentElement.clientWidth * dpr;
-    canvas.height = canvas.parentElement.clientHeight * dpr;
-  };
+  // Canvas resize
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 });
-
-// Configure Auth Forms UI
-function setAuthMode(mode) {
-  authMode = mode;
-  hideAlerts();
-  if (mode === 'login') {
-    tabLogin.classList.add('active');
-    tabSignup.classList.remove('active');
-    authTitle.textContent = 'Welcome Back';
-    authSubtitle.textContent = 'Sign in to access your speech-to-text dashboard.';
-    authSubmitBtn.querySelector('.btn-text').textContent = 'Sign In';
-  } else {
-    tabLogin.classList.remove('active');
-    tabSignup.classList.add('active');
-    authTitle.textContent = 'Create Account';
-    authSubtitle.textContent = 'Register a new account using your email.';
-    authSubmitBtn.querySelector('.btn-text').textContent = 'Sign Up';
-  }
-}
-
-function setAuthLoading(isLoading) {
-  if (isLoading) {
-    authSubmitBtn.setAttribute('disabled', 'true');
-    authSubmitBtn.querySelector('.btn-text').classList.add('hidden');
-    authSubmitBtn.querySelector('.btn-loader').classList.remove('hidden');
-  } else {
-    authSubmitBtn.removeAttribute('disabled');
-    authSubmitBtn.querySelector('.btn-text').classList.remove('hidden');
-    authSubmitBtn.querySelector('.btn-loader').classList.add('hidden');
-  }
-}
-
-function showError(msg) {
-  authError.querySelector('.alert-message').textContent = msg;
-  authError.classList.remove('hidden');
-}
-
-function showSuccess(msg) {
-  authSuccess.querySelector('.alert-message').textContent = msg;
-  authSuccess.classList.remove('hidden');
-}
-
-function hideAlerts() {
-  authError.classList.add('hidden');
-  authSuccess.classList.add('hidden');
-}
-
-// ----------------- STREAMING & SPEECH-TO-TEXT LOGIC -----------------
-
-async function startStreaming() {
-  try {
-    // 1. Check microphone permissions and obtain stream
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    statusAudio.textContent = 'Active';
-    statusAudio.className = 'status-indicator indicator-success';
-
-    // 2. Establish connection to local Python proxy WS endpoint
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    let wsUrl = `${protocol}//${host}/ws/transcribe`;
-
-    // Retrieve Deepgram API key (server env or fallback UI config)
-    const keyQuery = currentConfig.hasDeepgramKey ? '' : `?apiKey=${encodeURIComponent(currentConfig.localDeepgramKey)}`;
-    wsUrl += keyQuery;
-
-    wsConn = new WebSocket(wsUrl);
-    statusWebsocket.textContent = 'Connecting...';
-    statusWebsocket.className = 'status-indicator indicator-warning';
-
-    wsConn.onopen = () => {
-      console.log('WebSocket connection to Python backend opened.');
-      statusWebsocket.textContent = 'Connected';
-      statusWebsocket.className = 'status-indicator indicator-success';
-      transcribeIndicator.classList.remove('hidden');
-
-      // Update UI button state
-      btnMic.classList.add('recording');
-      iconMicOff.classList.remove('active');
-      iconMicOn.classList.add('active');
-      micStatusText.textContent = 'Streaming Audio';
-      micStatusText.classList.add('recording');
-
-      // Start Recording Chunks
-      startRecording();
-      // Start Drawing Audio Wave
-      startVisualizer(mediaStream);
-    };
-
-    wsConn.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        
-        // Handle server-side errors
-        if (data.error) {
-          alert(`Proxy Error: ${data.error}`);
-          stopStreaming();
-          return;
-        }
-
-        // Process Deepgram structure
-        if (data.channel && data.channel.alternatives) {
-          const alt = data.channel.alternatives[0];
-          const transcriptText = alt.transcript;
-          
-          if (transcriptText) {
-            transcriptEmpty.classList.add('hidden');
-            transcriptContainer.classList.remove('hidden');
-
-            if (data.is_final) {
-              // Append to final text history
-              finalTranscriptHistory += ' ' + transcriptText;
-              transcriptFinal.textContent = finalTranscriptHistory.trim() + ' ';
-              transcriptInterim.textContent = '';
-            } else {
-              // Show interim active text in real-time
-              transcriptInterim.textContent = transcriptText;
-            }
-
-            // Word counter helper
-            updateWordCount();
-            // Scroll down
-            transcriptFeed.scrollTop = transcriptFeed.scrollHeight;
-          }
-        }
-      } catch (err) {
-        console.error('Error parsing WebSocket message:', err);
-      }
-    };
-
-    wsConn.onerror = (err) => {
-      console.error('WebSocket Error:', err);
-      statusWebsocket.textContent = 'Error';
-      statusWebsocket.className = 'status-indicator indicator-danger';
-    };
-
-    wsConn.onclose = () => {
-      console.log('WebSocket closed.');
-      statusWebsocket.textContent = 'Disconnected';
-      statusWebsocket.className = 'status-indicator indicator-muted';
-      stopStreaming();
-    };
-
-  } catch (err) {
-    console.error('Error starting live transcription:', err);
-    alert('Microphone access is required or WebSocket connection failed.');
-    stopStreaming();
-  }
-}
-
-function startRecording() {
-  isRecording = true;
-  // Initialize MediaRecorder (webm/opus is default on modern browsers and accepted by Deepgram)
-  mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
-
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0 && wsConn && wsConn.readyState === WebSocket.OPEN) {
-      wsConn.send(e.data);
-    }
-  };
-
-  // Start sending audio chunks every 100ms
-  mediaRecorder.start(100);
-}
-
-function stopStreaming() {
-  isRecording = false;
-
-  // Stop MediaRecorder
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
-  mediaRecorder = null;
-
-  // Stop tracks
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(track => track.stop());
-  }
-  mediaStream = null;
-  statusAudio.textContent = 'Inactive';
-  statusAudio.className = 'status-indicator indicator-muted';
-
-  // Close WebSocket
-  if (wsConn) {
-    if (wsConn.readyState === WebSocket.OPEN) {
-      wsConn.close();
-    }
-  }
-  wsConn = null;
-
-  // Reset UI classes
-  btnMic.classList.remove('recording');
-  iconMicOn.classList.remove('active');
-  iconMicOff.classList.add('active');
-  micStatusText.textContent = 'Microphone Idle';
-  micStatusText.classList.remove('recording');
-  transcribeIndicator.classList.add('hidden');
-
-  // Stop Wave
-  stopVisualizer();
-}
-
-function updateWordCount() {
-  const fullText = (finalTranscriptHistory + ' ' + transcriptInterim.textContent).trim();
-  if (!fullText) {
-    totalWords = 0;
-  } else {
-    totalWords = fullText.split(/\s+/).filter(Boolean).length;
-  }
-  wordCountBadge.textContent = `${totalWords} word${totalWords === 1 ? '' : 's'}`;
-}
-
-// ----------------- CANVAS VISUALIZER LOOP -----------------
-
-function startVisualizer(stream) {
-  const canvas = document.getElementById('audio-visualizer');
-  const canvasCtx = canvas.getContext('2d');
-  
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  
-  // Resumes audio context if suspended by browser security
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-  }
-
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 128; // lower sizes for wider bar styling
-  const bufferLength = analyser.frequencyBinCount;
-  dataArray = new Uint8Array(bufferLength);
-  
-  visualizerSource = audioCtx.createMediaStreamSource(stream);
-  visualizerSource.connect(analyser);
-  
-  function draw() {
-    drawRequestFrame = requestAnimationFrame(draw);
-    analyser.getByteFrequencyData(dataArray);
-    
-    // Clear canvas
-    canvasCtx.fillStyle = 'rgba(10, 14, 25, 0.4)';
-    canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    const barWidth = (canvas.width / bufferLength) * 1.5;
-    let barHeight;
-    let x = 0;
-    
-    // Draw frequency spectrum
-    for (let i = 0; i < bufferLength; i++) {
-      barHeight = (dataArray[i] / 255) * canvas.height * 0.9;
-      
-      // Calculate cool cybernetic color gradient
-      const gradient = canvasCtx.createLinearGradient(0, canvas.height, 0, 0);
-      gradient.addColorStop(0, 'rgba(0, 242, 254, 0.15)');
-      gradient.addColorStop(0.5, 'rgba(0, 242, 254, 0.65)');
-      gradient.addColorStop(1, 'rgba(108, 38, 255, 0.85)');
-      
-      canvasCtx.fillStyle = gradient;
-      
-      // Double side bars from center height
-      const yOffset = (canvas.height - barHeight) / 2;
-      canvasCtx.fillRect(x, yOffset, barWidth - 3, barHeight);
-      
-      x += barWidth;
-    }
-  }
-  
-  draw();
-}
-
-function stopVisualizer() {
-  if (drawRequestFrame) {
-    cancelAnimationFrame(drawRequestFrame);
-    drawRequestFrame = null;
-  }
-  if (visualizerSource) {
-    visualizerSource.disconnect();
-    visualizerSource = null;
-  }
-  
-  // Clear visualizer to silent state
-  const canvas = document.getElementById('audio-visualizer');
-  const canvasCtx = canvas.getContext('2d');
-  canvasCtx.fillStyle = '#0a0e19';
-  canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-}
